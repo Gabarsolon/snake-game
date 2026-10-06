@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Snake Game</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background: radial-gradient(ellipse at center, #0b0f1a 0%, #03040a 100%);
+            overflow: hidden;
+        }
+        canvas {
+            border-radius: 8px;
+            box-shadow: 0 0 40px rgba(0, 255, 170, 0.15), 0 0 120px rgba(0, 255, 170, 0.07);
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="480" height="480"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        const W = canvas.width, H = canvas.height;
+        const buf = document.createElement('canvas');
+        buf.width = W; buf.height = H;
+        const b = buf.getContext('2d');
+
+        const tintR = document.createElement('canvas');
+        tintR.width = W; tintR.height = H;
+        const tr = tintR.getContext('2d');
+        const tintC = document.createElement('canvas');
+        tintC.width = W; tintC.height = H;
+        const tc = tintC.getContext('2d');
+
+        const CELL = 20;
+        const COLS = W / CELL;
+        const ROWS = H / CELL;
+        const BASE_SPEED = 125;
+        const MIN_SPEED = 70;
+        const COMBO_WINDOW = 2500;
+
+        let snake, prevSnake, direction, nextDirection, food, score, shownScore;
+        let best = 0, state = 'ready', speed, particles = [], popups = [], rings = [], trail = [];
+        let shake = 0, overT = 0, deathFade = 1, glitch = 0, timeScale = 1;
+        let combo = 1, lastEat = 0, foodCount = 0, newBest = false;
+        let state_t = 1, now = 0;
+        let banners = [], freezeUntil = 0, zoomKick = 0;
+        let soundOn = true, AC = null;
+        let flash = 0, nextStepTime = 0, stepIdx = 0, noiseBuf = null;
+        let top3 = [];
+        let pulse = 0;
+        try { top3 = JSON.parse(localStorage.getItem('snakeTop3')) || []; } catch (e) {}
+
+        try { best = parseInt(localStorage.getItem('snakeBest'), 10) || 0; } catch (e) {}
+
+        const KEYS = {
+            ArrowUp:    { x: 0, y: -1 },
+            ArrowDown:  { x: 0, y: 1 },
+            ArrowLeft:  { x: -1, y: 0 },
+            ArrowRight: { x: 1, y: 0 },
+            w: { x: 0, y: -1 },
+            s: { x: 0, y: 1 },
+            a: { x: -1, y: 0 },
+            d: { x: 1, y: 0 }
+        };
+
+        function initAudio() {
+            if (!AC) {
+                try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+            }
+            if (AC && AC.state === 'suspended') AC.resume();
+        }
+
+        function tone(f1, f2, dur, type, vol, delay) {
+            if (!soundOn || !AC) return;
+            try {
+                const t0 = AC.currentTime + (delay || 0);
+                const o = AC.createOscillator();
+                const g = AC.createGain();
+                o.type = type;
+                o.frequency.setValueAtTime(f1, t0);
+                if (f2) o.frequency.exponentialRampToValueAtTime(f2, t0 + dur);
+                g.gain.setValueAtTime(vol, t0);
+                g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+                o.connect(g);
+                g.connect(AC.destination);
+                o.start(t0);
+                o.stop(t0 + dur + 0.02);
+            } catch (e) {}
+        }
+
+        function getNoise() {
+            if (!noiseBuf) {
+                noiseBuf = AC.createBuffer(1, 2048, AC.sampleRate);
+                const d = noiseBuf.getChannelData(0);
+                for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+            }
+            return noiseBuf;
+        }
+
+        function kick(t) {
+            const o = AC.createOscillator(), g = AC.createGain();
+            o.type = 'sine';
+            o.frequency.setValueAtTime(150, t);
+            o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
+            g.gain.setValueAtTime(0.2, t);
+            g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+            o.connect(g); g.connect(AC.destination);
+            o.start(t); o.stop(t + 0.17);
+        }
+
+        function hat(t) {
+            const s = AC.createBufferSource(), g = AC.createGain(), f = AC.createBiquadFilter();
+            s.buffer = getNoise();
+            f.type = 'highpass'; f.frequency.value = 7000;
+            g.gain.setValueAtTime(0.06, t);
+            g.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+            s.connect(f); f.connect(g); g.connect(AC.destination);
+            s.start(t); s.stop(t + 0.05);
+        }
+
+        function bassNote(t, semi, dur) {
+            const o = AC.createOscillator(), g = AC.createGain(), f = AC.createBiquadFilter();
+            o.type = 'sawtooth';
+            o.frequency.value = 55 * Math.pow(2, semi / 12);
+            f.type = 'lowpass'; f.frequency.value = 450;
+            g.gain.setValueAtTime(0.11, t);
+            g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+            o.connect(f); f.connect(g); g.connect(AC.destination);
+            o.start(t); o.stop(t + dur + 0.02);
+        }
+
+        function arpNote(t, semi) {
+            const o = AC.createOscillator(), g = AC.createGain();
+            o.type = 'triangle';
+            o.frequency.value = 55 * Math.pow(2, semi / 12);
+            g.gain.setValueAtTime(0.045, t);
+            g.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+            o.connect(g); g.connect(AC.destination);
+            o.start(t); o.stop(t + 0.14);
+        }
+
+        const BASS_PAT = [0, null, 0, 12, 0, null, 7, null, 0, null, 0, 12, 5, null, 3, null];
+        const ARP_PAT = [12, 15, 17, 19, 22, 24, 22, 19];
+        const HAT_STEPS = [2, 6, 10, 14];
+
+        function scheduleMusic() {
+            if (!AC || !soundOn) return;
+            const bpm = Math.min(160, 110 + Math.min(combo, 12) * 4);
+            const stepDur = 60 / bpm / 4;
+            if (nextStepTime < AC.currentTime) nextStepTime = AC.currentTime + 0.05;
+            while (nextStepTime < AC.currentTime + 0.15) {
+                const s = stepIdx % 16;
+                const t = nextStepTime;
+                if (s % 4 === 0) kick(t);
+                if (HAT_STEPS.includes(s)) hat(t);
+                if (BASS_PAT[s] !== null) bassNote(t, BASS_PAT[s], stepDur * 1.8);
+                if (s % 2 === 1) arpNote(t, ARP_PAT[(stepIdx >> 1) % ARP_PAT.length] + Math.min(combo, 8));
+                nextStepTime += stepDur;
+                stepIdx++;
+            }
+        }
+
+        function strokeTube(g, pts, hueOff, alpha, w) {
+            if (pts.length < 2) return;
+            g.save();
+            g.globalAlpha = alpha;
+            g.lineCap = 'round';
+            g.lineJoin = 'round';
+            for (let pass = 0; pass < 2; pass++) {
+                for (let i = 0; i < pts.length - 1; i++) {
+                    const hue = (now / 25 + i * 9 + hueOff) % 360;
+                    if (pass === 0) {
+                        g.shadowColor = `hsl(${hue}, 100%, 55%)`;
+                        g.shadowBlur = 16;
+                        g.strokeStyle = `hsl(${hue}, 95%, 55%)`;
+                        g.lineWidth = w;
+                    } else {
+                        g.shadowBlur = 0;
+                        g.strokeStyle = `hsla(${hue}, 100%, 85%, 0.55)`;
+                        g.lineWidth = Math.max(2, w * 0.38);
+                    }
+                    g.beginPath();
+                    g.moveTo(pts[i].x, pts[i].y);
+                    g.lineTo(pts[i + 1].x, pts[i + 1].y);
+                    g.stroke();
+                }
+            }
+            g.restore();
+        }
+
+        const vignette = ctx.createRadialGradient(W / 2, H / 2, H / 3, W / 2, H / 2, H * 0.75);
+        vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
+        vignette.addColorStop(1, 'rgba(0, 0, 0, 0.55)');
+
+        const glowCyan = b.createRadialGradient(60, 60, 10, 60, 60, 300);
+        glowCyan.addColorStop(0, 'rgba(0, 255, 200, 0.07)');
+        glowCyan.addColorStop(1, 'rgba(0, 255, 200, 0)');
+
+        const glowPink = b.createRadialGradient(430, 430, 10, 430, 430, 300);
+        glowPink.addColorStop(0, 'rgba(255, 45, 120, 0.07)');
+        glowPink.addColorStop(1, 'rgba(255, 45, 120, 0)');
+
+        const stars = Array.from({ length: 70 }, () => ({
+            x: Math.random() * W,
+            y: Math.random() * H,
+            z: 0.3 + Math.random() * 0.7,
+            tw: Math.random() * Math.PI * 2
+        }));
+
+        const scanCanvas = document.createElement('canvas');
+        scanCanvas.width = 4;
+        scanCanvas.height = 3;
+        const scanCtx = scanCanvas.getContext('2d');
+        scanCtx.fillStyle = 'rgba(0, 0, 0, 0.22)';
+        scanCtx.fillRect(0, 0, 4, 1);
+        const scanPattern = ctx.createPattern(scanCanvas, 'repeat');
+
+        function resetGame() {
+            const midY = Math.floor(ROWS / 2);
+            snake = [
+                { x: 8, y: midY },
+                { x: 7, y: midY },
+                { x: 6, y: midY }
+            ];
+            prevSnake = snake.map(s => ({ ...s }));
+            direction = { x: 1, y: 0 };
+            nextDirection = { x: 1, y: 0 };
+            score = 0;
+            shownScore = 0;
+            speed = BASE_SPEED;
+            particles = [];
+            popups = [];
+            rings = [];
+            trail = [];
+            shake = 0;
+            overT = 0;
+            deathFade = 1;
+            glitch = 0;
+            timeScale = 1;
+            combo = 1;
+            foodCount = 0;
+            newBest = false;
+            banners = [];
+            freezeUntil = 0;
+            zoomKick = 0;
+            flash = 0;
+            placeFood();
+            state = 'ready';
+        }
+
+        function placeFood() {
+            const free = [];
+            for (let x = 0; x < COLS; x++) {
+                for (let y = 0; y < ROWS; y++) {
+                    if (!snake.some(s => s.x === x && s.y === y)) free.push({ x, y });
+                }
+            }
+            food = free.length ? free[Math.floor(Math.random() * free.length)] : null;
+            if (food) food.golden = (foodCount + 1) % 5 === 0;
+        }
+
+        function spawnBurst(cx, cy, hue, count, power) {
+            for (let i = 0; i < count; i++) {
+                const a = Math.random() * Math.PI * 2;
+                const sp = (0.05 + Math.random() * 0.12) * power;
+                particles.push({
+                    x: cx, y: cy,
+                    vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+                    life: 1, decay: 0.02 + Math.random() * 0.02,
+                    hue: hue + Math.random() * 30 - 15
+                });
+            }
+        }
+
+        function spawnConfetti() {
+            for (let i = 0; i < 90; i++) {
+                particles.push({
+                    x: Math.random() * W, y: -10 - Math.random() * 60,
+                    vx: (Math.random() - 0.5) * 0.08,
+                    vy: 0.06 + Math.random() * 0.12,
+                    life: 1.6, decay: 0.005 + Math.random() * 0.005,
+                    hue: Math.random() * 360,
+                    grav: 0.0003
+                });
+            }
+        }
+
+        function gameOver() {
+            state = 'over';
+            overT = 0;
+            shake = 20;
+            glitch = 1;
+            timeScale = 0.35;
+            zoomKick = 0.1;
+            flash = 0.65;
+            tone(300, 40, 0.6, 'sawtooth', 0.14);
+            rings.push({ x: (snake[0].x + 0.5) * CELL, y: (snake[0].y + 0.5) * CELL, r: 10, life: 1, hue: 345 });
+            snake.forEach(s => {
+                spawnBurst((s.x + 0.5) * CELL, (s.y + 0.5) * CELL, 165, 4, 1.4);
+            });
+            if (score > best) {
+                best = score;
+                newBest = true;
+                spawnConfetti();
+                tone(523, null, 0.1, 'triangle', 0.09);
+                tone(659, null, 0.1, 'triangle', 0.09, 0.12);
+                tone(784, null, 0.1, 'triangle', 0.09, 0.24);
+                tone(1046, null, 0.25, 'triangle', 0.09, 0.36);
+                try { localStorage.setItem('snakeBest', String(best)); } catch (e) {}
+            }
+            if (score > 0) {
+                top3.push(score);
+                top3.sort((a, c) => c - a);
+                top3 = top3.slice(0, 3);
+                try { localStorage.setItem('snakeTop3', JSON.stringify(top3)); } catch (e) {}
+            }
+        }
+
+        function tick() {
+            direction = nextDirection;
+            const head = { x: snake[0].x + direction.x, y: snake[0].y + direction.y };
+
+            if (head.x < 0 || head.y < 0 || head.x >= COLS || head.y >= ROWS) {
+                gameOver();
+                return;
+            }
+
+            const eating = food && head.x === food.x && head.y === food.y;
+            const limit = eating ? snake.length : snake.length - 1;
+            for (let i = 0; i < limit; i++) {
+                if (snake[i].x === head.x && snake[i].y === head.y) {
+                    gameOver();
+                    return;
+                }
+            }
+
+            prevSnake = snake.map(s => ({ x: s.x, y: s.y }));
+            snake.unshift(head);
+            if (eating) {
+                const base = food.golden ? 5 : 1;
+                combo = (performance.now() - lastEat < COMBO_WINDOW) ? combo + 1 : 1;
+                lastEat = performance.now();
+                const gain = base * combo;
+                score += gain;
+                speed = Math.max(MIN_SPEED, BASE_SPEED - score * 3);
+                const hue = food.golden ? 45 : 345;
+                spawnBurst((food.x + 0.5) * CELL, (food.y + 0.5) * CELL, hue, food.golden ? 30 : 16, food.golden ? 1.5 : 1);
+                rings.push({ x: (food.x + 0.5) * CELL, y: (food.y + 0.5) * CELL, r: 8, life: 1, hue });
+                popups.push({
+                    x: (food.x + 0.5) * CELL, y: (food.y + 0.5) * CELL,
+                    text: `+${gain}`, combo, life: 1
+                });
+                shake = Math.max(shake, food.golden ? 10 : 5);
+                freezeUntil = performance.now() + (food.golden ? 90 : 60);
+                zoomKick = Math.max(zoomKick, food.golden ? 0.08 : 0.04);
+                if (food.golden) {
+                    tone(1200, 2400, 0.14, 'square', 0.08);
+                    tone(1568, null, 0.2, 'triangle', 0.07, 0.08);
+                } else {
+                    tone(660, 1320, 0.08, 'square', 0.07);
+                    tone(990, null, 0.06, 'triangle', 0.05, 0.03);
+                }
+                if (combo > 1) {
+                    tone(440 * Math.pow(2, combo / 12), null, 0.07, 'triangle', 0.05);
+                }
+                if (combo > 0 && combo % 5 === 0) {
+                    const names = { 5: 'ON FIRE!', 10: 'UNSTOPPABLE!', 15: 'GODLIKE!', 20: 'LEGENDARY!' };
+                    banners.push({
+                        text: names[combo] || 'INSANE!',
+                        sub: `x${combo} COMBO`,
+                        life: 1
+                    });
+                    tone(880, null, 0.09, 'square', 0.07, 0.1);
+                    tone(1108, null, 0.09, 'square', 0.07, 0.2);
+                    tone(1318, null, 0.16, 'square', 0.07, 0.3);
+                }
+                foodCount++;
+                placeFood();
+            } else {
+                snake.pop();
+            }
+        }
+
+        function drawSnake(alpha) {
+            const pts = snake.map((s, i) => {
+                const from = prevSnake[i] || s;
+                return {
+                    x: (from.x + (s.x - from.x) * state_t + 0.5) * CELL,
+                    y: (from.y + (s.y - from.y) * state_t + 0.5) * CELL
+                };
+            });
+            strokeTube(b, pts, 0, alpha, 13);
+
+            if (state === 'playing' && pts.length) {
+                const hx = pts[0].x, hy = pts[0].y;
+                const pxv = -direction.y, pyv = direction.x;
+                b.save();
+                b.globalAlpha = alpha;
+                b.fillStyle = '#05070f';
+                for (const s of [1, -1]) {
+                    b.beginPath();
+                    b.arc(hx + direction.x * 4 + pxv * 4 * s,
+                          hy + direction.y * 4 + pyv * 4 * s, 2.6, 0, Math.PI * 2);
+                    b.fill();
+                }
+                b.restore();
+            }
+        }
+
+        function renderScene(dt) {
+            if (zoomKick > 0.002) {
+                b.save();
+                b.translate(W / 2, H / 2);
+                b.scale(1 + zoomKick, 1 + zoomKick);
+                b.translate(-W / 2, -H / 2);
+            }
+            b.fillStyle = '#05070f';
+            b.fillRect(0, 0, W, H);
+            b.fillStyle = glowCyan;
+            b.fillRect(0, 0, W, H);
+            b.fillStyle = glowPink;
+            b.fillRect(0, 0, W, H);
+
+            for (const s of stars) {
+                s.y += s.z * 0.08 * dt;
+                if (s.y > H) { s.y = -2; s.x = Math.random() * W; }
+                const a = 0.25 + 0.35 * Math.abs(Math.sin(now / 900 + s.tw));
+                b.fillStyle = `rgba(200, 230, 255, ${a * s.z})`;
+                b.fillRect(s.x, s.y, s.z * 1.6, s.z * 1.6);
+            }
+
+            b.strokeStyle = `rgba(120, 200, 255, ${0.025 + 0.07 * pulse})`;
+            b.lineWidth = 1;
+            for (let x = 0; x <= COLS; x++) {
+                b.beginPath();
+                b.moveTo(x * CELL + 0.5, 0);
+                b.lineTo(x * CELL + 0.5, H);
+                b.stroke();
+            }
+            for (let y = 0; y <= ROWS; y++) {
+                b.beginPath();
+                b.moveTo(0, y * CELL + 0.5);
+                b.lineTo(W, y * CELL + 0.5);
+                b.stroke();
+            }
+
+            if (food) {
+                const golden = food.golden;
+                const pulse = 1 + 0.18 * Math.sin(now / 160);
+                const fx = (food.x + 0.5) * CELL;
+                const fy = (food.y + 0.5) * CELL;
+                b.save();
+                b.shadowColor = golden ? '#ffd700' : '#ff2d78';
+                b.shadowBlur = golden ? 30 : 22;
+                b.fillStyle = golden ? '#ffd700' : '#ff2d78';
+                b.beginPath();
+                b.arc(fx, fy, (CELL / 2 - 3) * pulse, 0, Math.PI * 2);
+                b.fill();
+                b.fillStyle = 'rgba(255, 255, 255, 0.85)';
+                b.beginPath();
+                b.arc(fx - 2, fy - 2, 2.5, 0, Math.PI * 2);
+                b.fill();
+                if (golden) {
+                    b.strokeStyle = `rgba(255, 215, 0, ${0.5 + 0.4 * Math.sin(now / 120)})`;
+                    b.lineWidth = 2;
+                    b.beginPath();
+                    b.arc(fx, fy, 13 + 2 * Math.sin(now / 120), 0, Math.PI * 2);
+                    b.stroke();
+                }
+                b.restore();
+                const sp = golden ? 'rgba(255, 220, 80,' : 'rgba(255, 150, 200,';
+                for (let i = 0; i < 3; i++) {
+                    const a = now / 600 + i * Math.PI * 2 / 3;
+                    b.fillStyle = `${sp} 0.8)`;
+                    b.fillRect(fx + Math.cos(a) * 15 - 1.5, fy + Math.sin(a) * 15 - 1.5, 3, 3);
+                }
+            }
+
+            if (state === 'playing') {
+                const f = prevSnake[0] || snake[0];
+                const hxp = (f.x + (snake[0].x - f.x) * state_t + 0.5) * CELL;
+                const hyp = (f.y + (snake[0].y - f.y) * state_t + 0.5) * CELL;
+                trail.push({ x: hxp, y: hyp, life: 1 });
+                if (trail.length > 24) trail.shift();
+                if (Math.random() < 0.4) {
+                    particles.push({
+                        x: hxp, y: hyp,
+                        vx: (Math.random() - 0.5) * 0.06,
+                        vy: (Math.random() - 0.5) * 0.06,
+                        life: 0.7, decay: 0.03,
+                        hue: (now / 25) % 360
+                    });
+                }
+            }
+            b.save();
+            b.globalCompositeOperation = 'lighter';
+            for (let i = trail.length - 1; i >= 0; i--) {
+                const p = trail[i];
+                p.life -= dt / 450;
+                if (p.life <= 0) { trail.splice(i, 1); continue; }
+                const g = b.createRadialGradient(p.x, p.y, 0, p.x, p.y, 10);
+                g.addColorStop(0, `rgba(0, 255, 200, ${0.14 * p.life})`);
+                g.addColorStop(1, 'rgba(0, 255, 200, 0)');
+                b.fillStyle = g;
+                b.fillRect(p.x - 10, p.y - 10, 20, 20);
+            }
+            b.restore();
+
+            if (state !== 'over' || deathFade > 0) {
+                drawSnake(state === 'over' ? deathFade : 1);
+            }
+
+            b.save();
+            b.globalCompositeOperation = 'lighter';
+            for (let i = rings.length - 1; i >= 0; i--) {
+                const r = rings[i];
+                r.r += dt * 0.22;
+                r.life -= dt / 650;
+                if (r.life <= 0) { rings.splice(i, 1); continue; }
+                b.strokeStyle = `hsla(${r.hue}, 100%, 65%, ${r.life * 0.8})`;
+                b.lineWidth = 3 * r.life;
+                b.beginPath();
+                b.arc(r.x, r.y, r.r, 0, Math.PI * 2);
+                b.stroke();
+            }
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.x += p.vx * dt;
+                p.y += p.vy * dt;
+                if (p.grav) p.vy += p.grav * dt;
+                p.life -= p.decay * dt / 16;
+                if (p.life <= 0) { particles.splice(i, 1); continue; }
+                b.fillStyle = `hsla(${p.hue}, 100%, 65%, ${Math.min(1, p.life)})`;
+                b.fillRect(p.x - 2, p.y - 2, 4, 4);
+            }
+            b.restore();
+
+            shownScore += (score - shownScore) * Math.min(1, dt / 150);
+            if (Math.abs(score - shownScore) < 0.5) shownScore = score;
+
+            b.save();
+            b.shadowColor = 'rgba(0, 255, 200, 0.6)';
+            b.shadowBlur = 10;
+            b.fillStyle = '#7ef9ff';
+            b.font = 'bold 18px monospace';
+            b.textAlign = 'left';
+            b.fillText(`SCORE ${String(Math.round(shownScore)).padStart(3, '0')}`, 12, 26);
+            if (combo > 1 && state === 'playing' && now - lastEat < COMBO_WINDOW) {
+                b.fillStyle = `hsla(${(now / 10) % 360}, 100%, 65%, 1)`;
+                b.font = 'bold 16px monospace';
+                b.fillText(`x${combo}`, 148, 26);
+            }
+            b.textAlign = 'right';
+            b.fillStyle = '#7ef9ff';
+            b.font = 'bold 18px monospace';
+            b.fillText(`BEST ${String(best).padStart(3, '0')}`, W - 12, 26);
+            b.restore();
+
+            for (let i = popups.length - 1; i >= 0; i--) {
+                const p = popups[i];
+                p.y -= 0.5 * dt / 16;
+                p.life -= 0.02 * dt / 16;
+                if (p.life <= 0) { popups.splice(i, 1); continue; }
+                b.fillStyle = `rgba(255, 45, 120, ${p.life})`;
+                b.font = 'bold 24px monospace';
+                b.textAlign = 'center';
+                b.fillText(p.text, p.x, p.y);
+                if (p.combo > 1) {
+                    b.fillStyle = `hsla(${(now / 10) % 360}, 100%, 70%, ${p.life})`;
+                    b.font = 'bold 15px monospace';
+                    b.fillText(`x${p.combo}`, p.x, p.y + 18);
+                }
+            }
+
+            for (let i = banners.length - 1; i >= 0; i--) {
+                const bn = banners[i];
+                bn.life -= dt / 1800;
+                if (bn.life <= 0) { banners.splice(i, 1); continue; }
+                const pop = 1 + 0.3 * Math.sin(Math.min(1, (1 - bn.life) * 5) * Math.PI);
+                b.save();
+                b.translate(W / 2, H * 0.34);
+                b.scale(pop, pop);
+                b.textAlign = 'center';
+                b.shadowColor = `hsl(${(now / 10) % 360}, 100%, 60%)`;
+                b.shadowBlur = 24;
+                b.fillStyle = `hsla(${(now / 10) % 360}, 100%, 65%, ${Math.min(1, bn.life * 2)})`;
+                b.font = 'bold 36px monospace';
+                b.fillText(bn.text, 0, 0);
+                b.shadowBlur = 8;
+                b.fillStyle = `rgba(255, 255, 255, ${Math.min(1, bn.life * 2)})`;
+                b.font = 'bold 18px monospace';
+                b.fillText(bn.sub, 0, 30);
+                b.restore();
+            }
+
+            if (zoomKick > 0.002) b.restore();
+        }
+
+        function tint(src, g, color) {
+            g.globalCompositeOperation = 'source-over';
+            g.clearRect(0, 0, W, H);
+            g.drawImage(src, 0, 0);
+            g.globalCompositeOperation = 'source-atop';
+            g.fillStyle = color;
+            g.fillRect(0, 0, W, H);
+            g.globalCompositeOperation = 'source-over';
+        }
+
+        function composite() {
+            ctx.fillStyle = '#05070f';
+            ctx.fillRect(0, 0, W, H);
+
+            if (ctx.filter !== undefined) {
+                ctx.save();
+                ctx.filter = 'blur(7px)';
+                ctx.globalCompositeOperation = 'lighter';
+                ctx.globalAlpha = 0.5;
+                ctx.drawImage(buf, 0, 0);
+                ctx.restore();
+            }
+
+            const split = Math.min(10, shake * 0.7 + glitch * 9);
+            if (split > 0.6) {
+                tint(buf, tr, '#ff0000');
+                tint(buf, tc, '#00ffff');
+                ctx.save();
+                ctx.globalCompositeOperation = 'lighter';
+                ctx.globalAlpha = 0.28;
+                ctx.drawImage(tintR, split, 0);
+                ctx.drawImage(tintC, -split, 0);
+                ctx.restore();
+            }
+
+            const strips = 72;
+            const sh = H / strips;
+            for (let i = 0; i < strips; i++) {
+                const y = i * sh;
+                const k = i / (strips - 1) - 0.5;
+                const off = -(k * Math.abs(k)) * 15 * (1 + glitch * 2);
+                ctx.drawImage(buf, 0, y, W, sh + 1, off, y, W, sh + 1);
+            }
+
+            if (glitch > 0.04) {
+                const n = 3 + Math.floor(glitch * 5);
+                for (let i = 0; i < n; i++) {
+                    const y = Math.random() * H;
+                    const h = 6 + Math.random() * 30;
+                    const dx = (Math.random() - 0.5) * 50 * glitch;
+                    ctx.drawImage(buf, 0, y, W, h, dx, y, W, h);
+                }
+            }
+
+            ctx.fillStyle = vignette;
+            ctx.fillRect(0, 0, W, H);
+            ctx.fillStyle = scanPattern;
+            ctx.globalAlpha = 0.75 + Math.random() * 0.25;
+            ctx.fillRect(0, 0, W, H);
+            ctx.globalAlpha = 1;
+        }
+
+        function render(dt) {
+            const bpm = Math.min(160, 110 + Math.min(combo, 12) * 4);
+            pulse = Math.pow(1 - ((now / 1000 * bpm / 60) % 1), 3);
+            const bh = (now / 20) % 360;
+            canvas.style.boxShadow = `0 0 ${34 + 14 * pulse}px hsla(${bh}, 100%, 60%, 0.35), 0 0 ${105 + 40 * pulse}px hsla(${bh}, 100%, 60%, 0.16)`;
+            shake *= Math.pow(0.88, dt / 16);
+            glitch = Math.max(0, glitch - dt / 700);
+            zoomKick *= Math.pow(0.86, dt / 16);
+            flash *= Math.pow(0.9, dt / 16);
+            timeScale += (1 - timeScale) * Math.min(1, dt / 1200);
+            if (state === 'over') {
+                deathFade = Math.max(0, deathFade - dt / 500);
+                overT += dt;
+            }
+
+            renderScene(dt);
+            composite();
+            if (flash > 0.01) {
+                ctx.fillStyle = `rgba(255, 255, 255, ${Math.min(1, flash)})`;
+                ctx.fillRect(0, 0, W, H);
+            }
+
+            if (state === 'ready') {
+                const ap = [];
+                for (let i = 0; i < 20; i++) {
+                    const ax = ((now / 9 + i * 27) % (W + 160)) - 80;
+                    ap.push({ x: ax, y: H * 0.74 + Math.sin(ax / 55 + now / 600) * 42 });
+                }
+                strokeTube(ctx, ap, 180, 0.3, 11);
+                const k = 1 + 0.05 * Math.sin(now / 300);
+                ctx.save();
+                ctx.translate(W / 2, H / 2 - 20);
+                ctx.scale(k, k);
+                ctx.textAlign = 'center';
+                const grad = ctx.createLinearGradient(-110, 0, 110, 0);
+                for (let i = 0; i <= 6; i++) {
+                    grad.addColorStop(i / 6, `hsl(${(now / 12 + i * 60) % 360}, 100%, 60%)`);
+                }
+                ctx.shadowColor = '#00ffc8';
+                ctx.shadowBlur = 35;
+                ctx.fillStyle = grad;
+                ctx.font = 'bold 68px monospace';
+                ctx.fillText('SNAKE', 0, 0);
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+                ctx.strokeText('SNAKE', 0, 0);
+                ctx.restore();
+                ctx.textAlign = 'center';
+                ctx.fillStyle = `rgba(255, 255, 255, ${0.5 + 0.5 * Math.sin(now / 400)})`;
+                ctx.font = '18px monospace';
+                ctx.fillText('Press an arrow key to start', W / 2, H / 2 + 52);
+                ctx.fillStyle = 'rgba(126, 249, 255, 0.5)';
+                ctx.font = '13px monospace';
+                ctx.fillText('arrows / WASD  \u00b7  golden food = 5x  \u00b7  keep the streak  \u00b7  M mute', W / 2, H - 24);
+            }
+
+            if (state === 'over') {
+                const a = Math.max(0, Math.min(1, (overT - 350) / 400));
+                ctx.fillStyle = `rgba(3, 4, 10, ${0.78 * a})`;
+                ctx.fillRect(0, 0, W, H);
+                ctx.textAlign = 'center';
+                ctx.save();
+                ctx.globalAlpha = a;
+                ctx.shadowColor = '#ff2d78';
+                ctx.shadowBlur = 25;
+                ctx.fillStyle = '#ff2d78';
+                ctx.font = 'bold 44px monospace';
+                ctx.fillText('GAME OVER', W / 2, H / 2 - 40);
+                ctx.restore();
+                ctx.globalAlpha = a;
+                ctx.fillStyle = '#7ef9ff';
+                ctx.font = '20px monospace';
+                ctx.fillText(`Score ${score}   Best ${best}`, W / 2, H / 2 + 2);
+                if (newBest && a > 0.4) {
+                    ctx.save();
+                    ctx.shadowColor = '#ffd700';
+                    ctx.shadowBlur = 20;
+                    ctx.fillStyle = `hsl(${(now / 8) % 360}, 100%, 60%)`;
+                    ctx.font = 'bold 24px monospace';
+                    ctx.fillText('NEW BEST!', W / 2, H / 2 + 38);
+                    ctx.restore();
+                }
+                if (a > 0.35 && top3.length) {
+                    ctx.fillStyle = `rgba(126, 249, 255, ${a * 0.65})`;
+                    ctx.font = 'bold 14px monospace';
+                    ctx.fillText('TOP 3', W / 2, H / 2 + 72);
+                    ctx.font = '15px monospace';
+                    for (let i = 0; i < top3.length; i++) {
+                        ctx.fillStyle = `rgba(255, 255, 255, ${a * 0.55})`;
+                        ctx.fillText(`#${i + 1}   ${top3[i]}`, W / 2, H / 2 + 92 + i * 20);
+                    }
+                }
+                if (a > 0.6) {
+                    ctx.fillStyle = `rgba(255, 255, 255, ${(a - 0.6) / 0.4 * (0.5 + 0.5 * Math.sin(now / 400))})`;
+                    ctx.font = '16px monospace';
+                    ctx.fillText('Press Enter or click to restart  \u00b7  M mute', W / 2, Math.min(H / 2 + 150, H - 40));
+                }
+                ctx.globalAlpha = 1;
+            }
+        }
+
+        document.addEventListener('keydown', (e) => {
+            initAudio();
+            if (e.key === 'm' || e.key === 'M') {
+                soundOn = !soundOn;
+                return;
+            }
+            if (state === 'over' && (e.key === 'Enter' || e.key === ' ')) {
+                e.preventDefault();
+                resetGame();
+                return;
+            }
+            const nd = KEYS[e.key] || KEYS[e.key.toLowerCase()];
+            if (nd) {
+                e.preventDefault();
+                if (nd.x !== -nextDirection.x || nd.y !== -nextDirection.y) {
+                    nextDirection = nd;
+                    if (state === 'ready') {
+                        state = 'playing';
+                        lastEat = performance.now();
+                        tone(440, 880, 0.12, 'triangle', 0.08);
+                    }
+                }
+            }
+        });
+
+        canvas.addEventListener('click', () => {
+            initAudio();
+            if (state === 'over') resetGame();
+        });
+
+        let last = performance.now();
+        let acc = 0;
+
+        function frame(t) {
+            now = t;
+            scheduleMusic();
+            const rawDt = Math.min(t - last, 100);
+            last = t;
+            const frozen = t < freezeUntil;
+            const dt = frozen ? 0 : rawDt * timeScale;
+
+            if (state === 'playing' && !frozen) {
+                acc += dt;
+                while (acc >= speed) {
+                    acc -= speed;
+                    tick();
+                    if (state !== 'playing') break;
+                }
+                state_t = Math.min(acc / speed, 1);
+            } else if (state !== 'playing') {
+                state_t = 1;
+            }
+
+            render(dt);
+            requestAnimationFrame(frame);
+        }
+
+        resetGame();
+        requestAnimationFrame(frame);
+    </script>
+</body>
+</html>
